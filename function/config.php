@@ -11,7 +11,19 @@ if ($mysqli->connect_error) {
 $pdo = new PDO("mysql:host=localhost;dbname=chatapp", "root", "", [
     PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
 ]);
-session_start();
+
+$sessionLifetime = 60 * 60 * 24 * 3; // 3 days
+ini_set('session.gc_maxlifetime', (string) $sessionLifetime);
+session_set_cookie_params([
+    'lifetime' => $sessionLifetime,
+    'path' => '/',
+    'httponly' => true,
+    'samesite' => 'Lax',
+]);
+
+if (session_status() === PHP_SESSION_NONE) {
+    session_start();
+}
 
 
 function alert($content, $title = "") {

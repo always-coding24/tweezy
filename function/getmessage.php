@@ -26,6 +26,14 @@ function getMessage($user)
         return;
     }
 
+    $limit = 15;
+    if (isset($_GET["limit"]) && ctype_digit((string)$_GET["limit"])) {
+        $requestedLimit = (int)$_GET["limit"];
+        if ($requestedLimit > 0) {
+            $limit = min($requestedLimit, 500);
+        }
+    }
+
     // Fetch friend details
     $friend = $pdo->prepare("SELECT `username`, `image` FROM users WHERE id = ?");
     $friend->execute([$user]);
@@ -38,8 +46,17 @@ function getMessage($user)
     $friend_username = $friend_info[0]["username"];
     $friend_image = $friend_info[0]["image"];
 
-    // Fetch messages between users
-    $stmt = $pdo->prepare("SELECT * FROM messages WHERE (recipient_id = ? AND sender_id = ?) OR (recipient_id = ? AND sender_id = ?) ORDER BY `sent_at` ASC");
+    // Fetch only the latest N messages, then reorder ascending for chat display.
+    $stmt = $pdo->prepare("
+        SELECT * FROM (
+            SELECT *
+            FROM messages
+            WHERE (recipient_id = ? AND sender_id = ?) OR (recipient_id = ? AND sender_id = ?)
+            ORDER BY `sent_at` DESC, `message_id` DESC
+            LIMIT $limit
+        ) AS latest_messages
+        ORDER BY `sent_at` ASC, `message_id` ASC
+    ");
     $stmt->execute([$user, $_SESSION['user_id'], $_SESSION['user_id'], $user]);
     $messages = $stmt->fetchAll();
 
@@ -146,7 +163,7 @@ function getMessage($user)
                                             <li>
                                                 <hr class="dropdown-divider">
                                             </li>
-                                            <li>
+                                            <li onclick="deleteMessage(' . $id . ')">
                                                 <span class="dropdown-item d-flex align-items-center text-danger" href="#">
                                                     <span class="me-auto">Delete</span>
                                                     <div class="icon">
