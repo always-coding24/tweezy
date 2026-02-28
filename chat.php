@@ -57,6 +57,10 @@ include "function/auth.php";
 <!-- <script src="assets/js/bootstrap.min.js"></script> -->
 <script src="assets/js/vendor.js" defer></script>
 <script src="assets/js/ajax.js"></script>
+<script>
+    window.CHAT_USER_ID = <?= (int)($_SESSION['user_id'] ?? 0) ?>;
+    window.CHAT_WS_PORT = 8080;
+</script>
 <script src="assets/js/chat.js"></script> 
 <script src="assets/js/template.js" ></script>
 <script src="assets/alert/sweetalert2.js"></script> 

@@ -2,16 +2,30 @@ $(document).ready(function() {
     const MESSAGE_URL = 'function/getmessage.php';
     const SEND_MESSAGE_URL = 'function/sendmessage.php';
     const DELETE_MESSAGE_URL = 'function/delete.php';
+    const MARK_READ_URL = 'function/markread.php';
     const TYPING_STATUS_URL = 'function/typingstatus.php';
     const GET_TYPING_STATUS_URL = 'function/gettypingstatus.php';
     const GET_STATUS = 'function/status.php';
     const PAGE_SIZE = 15;
     const POLL_INTERVAL_MS = 1000;
+    const FALLBACK_MESSAGE_POLL_MS = 3000;
+    const SOCKET_SYNC_POLL_MS = 5000;
+    const WS_RECONNECT_MS = 3000;
     let loadedLimit = PAGE_SIZE;
     let hasMoreMessages = true;
     let isPaginationLoading = false;
     let isMessagesRequestInFlight = false;
     let isInitialLoadDone = false;
+    let chatSocket = null;
+    let socketConnected = false;
+    let socketReconnectTimer = null;
+    let friendIsTyping = false;
+    let friendStatusLabel = 'offline';
+    let typingStateSent = false;
+    let typingStopTimer = null;
+    let isMarkingRead = false;
+    let jumpButton = null;
+    let jumpCountNode = null;
 
     // Function to load content from a URL
     async function loadUrl(url) {
@@ -37,6 +51,12 @@ $(document).ready(function() {
     }
 
     const userid = getUrlParameter('id');
+    const currentUserId = Number(window.CHAT_USER_ID || 0);
+    const chatRoomId = (
+        currentUserId > 0 && Number(userid) > 0
+            ? [currentUserId, Number(userid)].sort((a, b) => a - b).join(':')
+            : null
+    );
     const noMessageHTML = `<div class="d-flex flex-column h-100 justify-content-center">
                 <div class="text-center mb-6">
                     <span class="icon icon-xl text-muted">
@@ -48,6 +68,239 @@ $(document).ready(function() {
                 </div>
                 <p class="text-center text-muted">No messages yet, <br> start the conversation!</p>
               </div>`;
+
+    function getSocketUrl() {
+        const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
+        const host = window.location.hostname;
+        const port = Number(window.CHAT_WS_PORT || 8080);
+        return `${protocol}://${host}:${port}`;
+    }
+
+    function scheduleSocketReconnect() {
+        if (socketReconnectTimer || !chatRoomId) {
+            return;
+        }
+
+        socketReconnectTimer = window.setTimeout(() => {
+            socketReconnectTimer = null;
+            connectChatSocket();
+        }, WS_RECONNECT_MS);
+    }
+
+    function notifySocket(eventName) {
+        if (!chatSocket || chatSocket.readyState !== WebSocket.OPEN || !chatRoomId) {
+            return;
+        }
+
+        chatSocket.send(JSON.stringify({
+            type: 'chat:update',
+            room: chatRoomId,
+            event: eventName,
+            user_id: currentUserId
+        }));
+    }
+
+    function notifyTypingSocket(isTyping) {
+        if (!chatSocket || chatSocket.readyState !== WebSocket.OPEN || !chatRoomId) {
+            return false;
+        }
+
+        chatSocket.send(JSON.stringify({
+            type: 'typing:update',
+            room: chatRoomId,
+            user_id: currentUserId,
+            typing: !!isTyping
+        }));
+        return true;
+    }
+
+    function isChatNearBottom(threshold = 80) {
+        const chatBodyNode = document.querySelector('.chat-body');
+        if (!chatBodyNode) {
+            return true;
+        }
+
+        return chatBodyNode.scrollHeight - (chatBodyNode.scrollTop + chatBodyNode.clientHeight) <= threshold;
+    }
+
+    function getUnreadIncomingCount() {
+        return document.querySelectorAll('.chat-logs .message.message-in[data-seen="0"]').length;
+    }
+
+    function ensureJumpButton() {
+        if (jumpButton) {
+            return;
+        }
+
+        jumpButton = document.createElement('button');
+        jumpButton.type = 'button';
+        jumpButton.id = 'jump-to-latest-btn';
+        jumpButton.className = 'btn btn-primary shadow rounded-pill d-none';
+        jumpButton.style.cssText = 'position:fixed;left:50%;transform:translateX(-50%);bottom:100px;z-index:1200;';
+        jumpButton.innerHTML = '<span aria-hidden="true">↓</span> <span id="jump-unread-count" class="badge bg-light text-dark">0</span>';
+        jumpButton.addEventListener('click', async () => {
+            scrollChatToBottom();
+            await markMessagesAsReadIfAtBottom(true);
+            updateJumpButtonState();
+        });
+        document.body.appendChild(jumpButton);
+        jumpCountNode = jumpButton.querySelector('#jump-unread-count');
+    }
+
+    function updateJumpButtonState() {
+        if (!jumpButton) {
+            return;
+        }
+
+        const unreadCount = getUnreadIncomingCount();
+        const atBottom = isChatNearBottom(16);
+
+        if (jumpCountNode && jumpCountNode.textContent !== String(unreadCount)) {
+            jumpCountNode.textContent = String(unreadCount);
+        }
+
+        if (atBottom || unreadCount < 1) {
+            jumpButton.classList.add('d-none');
+            return;
+        }
+
+        jumpButton.classList.remove('d-none');
+    }
+
+    async function markMessagesAsReadIfAtBottom(force = false) {
+        if (!userid || isMarkingRead) {
+            return;
+        }
+
+        const atBottom = isChatNearBottom(16);
+        if (!force && !atBottom) {
+            return;
+        }
+
+        const unreadCount = getUnreadIncomingCount();
+        if (unreadCount < 1) {
+            return;
+        }
+
+        isMarkingRead = true;
+        try {
+            await $.ajax({
+                url: MARK_READ_URL,
+                method: 'POST',
+                dataType: 'json',
+                data: { sender_id: userid }
+            });
+
+            sessionStorage.removeItem('message');
+            await getMessages(userid, {
+                limit: loadedLimit,
+                waitForIdle: true,
+                allowRequestGrowth: false,
+                forceRender: true,
+                skipAutoRead: true
+            });
+        } catch (error) {
+            console.error('Failed to mark read:', error);
+        } finally {
+            isMarkingRead = false;
+            updateJumpButtonState();
+        }
+    }
+
+    function connectChatSocket() {
+        if (!chatRoomId) {
+            return;
+        }
+
+        if (chatSocket && (chatSocket.readyState === WebSocket.OPEN || chatSocket.readyState === WebSocket.CONNECTING)) {
+            return;
+        }
+
+        try {
+            chatSocket = new WebSocket(getSocketUrl());
+        } catch (error) {
+            socketConnected = false;
+            scheduleSocketReconnect();
+            return;
+        }
+
+        chatSocket.addEventListener('open', () => {
+            socketConnected = true;
+            console.log('[WS] connected', { room: chatRoomId });
+            chatSocket.send(JSON.stringify({
+                type: 'subscribe',
+                room: chatRoomId,
+                user_id: currentUserId
+            }));
+            getMessages(userid, {
+                limit: loadedLimit,
+                waitForIdle: true
+            });
+        });
+
+        chatSocket.addEventListener('message', async (event) => {
+            let payload = null;
+            try {
+                payload = JSON.parse(event.data);
+            } catch (error) {
+                return;
+            }
+
+            if (!payload) {
+                return;
+            }
+
+            if (payload.type === 'subscribed') {
+                console.log('[WS] subscribed', payload);
+                return;
+            }
+
+            if (payload.type === 'presence:snapshot' && payload.room === chatRoomId) {
+                const friendOnline = !!payload.users?.[String(userid)];
+                setFriendStatus(friendOnline ? 'online' : 'offline');
+                return;
+            }
+
+            if (payload.type === 'presence:update' && payload.room === chatRoomId && Number(payload.user_id) === Number(userid)) {
+                setFriendStatus(payload.online ? 'online' : 'offline');
+                return;
+            }
+
+            if (payload.type === 'typing:update' && payload.room === chatRoomId && Number(payload.user_id) === Number(userid)) {
+                setFriendTyping(!!payload.typing);
+                return;
+            }
+
+            if (payload.type === 'chat:update' && payload.room === chatRoomId) {
+                console.log('[WS] chat:update', payload);
+                const shouldScroll = isChatNearBottom();
+                await getMessages(userid, {
+                    limit: loadedLimit,
+                    waitForIdle: true
+                });
+
+                if (shouldScroll && payload.event === 'message_sent') {
+                    scrollChatToBottom();
+                }
+            }
+        });
+
+        chatSocket.addEventListener('close', () => {
+            socketConnected = false;
+            chatSocket = null;
+            typingStateSent = false;
+            console.log('[WS] disconnected');
+            scheduleSocketReconnect();
+        });
+
+        chatSocket.addEventListener('error', () => {
+            socketConnected = false;
+            console.log('[WS] error');
+            if (chatSocket) {
+                chatSocket.close();
+            }
+        });
+    }
 
     function getMessageIdsFromMarkup(markup) {
         const template = document.createElement('template');
@@ -201,7 +454,8 @@ $(document).ready(function() {
             showLoading = false,
             allowRequestGrowth = true,
             waitForIdle = false,
-            forceRender = false
+            forceRender = false,
+            skipAutoRead = false
         } = options;
 
         if (isMessagesRequestInFlight) {
@@ -269,11 +523,16 @@ $(document).ready(function() {
                     loadedLimit = Math.max(loadedLimit, retryLimit);
                 }
             }
+            updateJumpButtonState();
         } finally {
             if (showLoading) {
                 hideLoadingAlert();
             }
             isMessagesRequestInFlight = false;
+        }
+
+        if (!skipAutoRead) {
+            await markMessagesAsReadIfAtBottom();
         }
 
         if (retryLimit !== null) {
@@ -295,12 +554,15 @@ $(document).ready(function() {
             });
             $('#message').val('');
             updateSendButtonState();
+            setLocalTypingState(false);
+            notifySocket('message_sent');
             await getMessages(userid, {
                 limit: loadedLimit,
                 waitForIdle: true,
                 forceRender: true
             });
             scrollChatToBottom();
+            updateJumpButtonState();
             stopAlert();
             const sound = document.getElementById("sound");
             if (sound) {
@@ -351,6 +613,47 @@ $(document).ready(function() {
 
         if (node.innerHTML !== html) {
             node.innerHTML = html;
+        }
+    }
+
+    function setFriendTyping(isTyping) {
+        friendIsTyping = !!isTyping;
+        if (friendIsTyping) {
+            updateTypingLabel("is typing<span class='typing-dots'><span>.</span><span>.</span><span>.</span></span>");
+            return;
+        }
+
+        updateTypingLabel(friendStatusLabel);
+    }
+
+    function setFriendStatus(statusLabel) {
+        const value = (statusLabel || '').trim();
+        friendStatusLabel = value || 'offline';
+        updateAvatarStatus(friendStatusLabel === 'online' ? 'online' : 'offline');
+
+        if (!friendIsTyping) {
+            updateTypingLabel(friendStatusLabel);
+        }
+    }
+
+    function setLocalTypingState(isTyping) {
+        const shouldType = !!isTyping;
+        if (typingStateSent === shouldType) {
+            return;
+        }
+
+        typingStateSent = shouldType;
+        if (notifyTypingSocket(shouldType)) {
+            return;
+        }
+
+        if (shouldType) {
+            $.post(TYPING_STATUS_URL, { recipient_id: userid });
+        } else {
+            $.post(TYPING_STATUS_URL, {
+                recipient_id: userid,
+                nottyping: "true"
+            });
         }
     }
 
@@ -422,10 +725,12 @@ $(document).ready(function() {
 
             removeMessageFromChat(numericMessageId);
             sessionStorage.removeItem("message");
+            notifySocket('message_deleted');
             await getMessages(userid, {
                 limit: loadedLimit,
                 waitForIdle: true
             });
+            updateJumpButtonState();
         } catch (error) {
             if (typeof Swal !== "undefined") {
                 Swal.fire({
@@ -447,21 +752,32 @@ $(document).ready(function() {
     if (userid) {
         // Load initial messages and set up periodic updates
         (async function initChat() {
+            ensureJumpButton();
             await getMessages(userid, {
                 limit: loadedLimit,
-                waitForIdle: true
+                waitForIdle: true,
+                forceRender: true
             });
+            connectChatSocket();
             updateSendButtonState();
             scrollChatToBottom();
             isInitialLoadDone = true;
             setInterval(async () => {
-                if ($('main').hasClass("is-visible")) {
+                if ($('main').hasClass("is-visible") && !socketConnected) {
                     await getMessages(userid, {
                         limit: loadedLimit
                     });
                     updateSendButtonState();
                 }
-            }, POLL_INTERVAL_MS);
+            }, FALLBACK_MESSAGE_POLL_MS);
+            setInterval(async () => {
+                if ($('main').hasClass("is-visible") && socketConnected) {
+                    await getMessages(userid, {
+                        limit: loadedLimit
+                    });
+                    updateSendButtonState();
+                }
+            }, SOCKET_SYNC_POLL_MS);
         })();
 
         // Submit chat message on form submission
@@ -472,11 +788,15 @@ $(document).ready(function() {
 
         // Update typing status periodically
         setInterval(async () => {
-            await updateTypingStatus(userid);
+            if (!socketConnected) {
+                await updateTypingStatus(userid);
+            }
         }, POLL_INTERVAL_MS);
 
         $('.chat-body').on('scroll', debounce(async () => {
             await handleChatScrollTopPagination();
+            updateJumpButtonState();
+            await markMessagesAsReadIfAtBottom();
         }, 150));
 
         // Update typing status
@@ -488,12 +808,8 @@ $(document).ready(function() {
             }
 
             const trimmedStatus = status.trim();
-            const typingLabel = responseText.trim() === "true"
-                ? "is typing<span class='typing-dots'><span>.</span><span>.</span><span>.</span></span>"
-                : trimmedStatus;
-
-            updateTypingLabel(typingLabel);
-            updateAvatarStatus(trimmedStatus);
+            setFriendStatus(trimmedStatus);
+            setFriendTyping(responseText.trim() === "true");
         }, 500);
       
         // Detect typing and update status
@@ -508,14 +824,26 @@ $(document).ready(function() {
                     $('.chat-form').trigger('submit');
                 }
             }
-        }).on("input", async function() {
+        }).on("input", function() {
             updateSendButtonState();
-            await $.post(TYPING_STATUS_URL, { recipient_id: userid });
-        }).on("blur", async function() {
-            await $.post(TYPING_STATUS_URL, {
-                recipient_id: userid,
-                nottyping: "true"
-            });
+            const hasText = !!$(this).val().trim();
+            setLocalTypingState(hasText);
+
+            if (typingStopTimer) {
+                clearTimeout(typingStopTimer);
+            }
+
+            if (hasText) {
+                typingStopTimer = setTimeout(() => {
+                    setLocalTypingState(false);
+                }, 1200);
+            }
+        }).on("blur", function() {
+            if (typingStopTimer) {
+                clearTimeout(typingStopTimer);
+                typingStopTimer = null;
+            }
+            setLocalTypingState(false);
         });
     }
 

@@ -87,9 +87,8 @@ function getMessage($user)
                 $avatar = '<a href="#" data-bs-toggle="offcanvas" data-bs-target="#offcanvas-more" aria-controls="offcanvas-more"class="avatar avatar-responsive"><span class="avatar-text">'. strtoupper($friend_username[0]) . '</span></a>';
             } else {
                 $avatar = "";
-                $clear = $pdo->prepare("UPDATE messages SET seen = NOW() WHERE seen IS NULL AND recipient_id = ? ");
-                $clear->execute([$_SESSION['user_id']]);
             }
+            $isSeen = !empty($message['seen']) ? "1" : "0";
             $reply = "";
             if (!is_null($message['reply'])) {
 
@@ -114,7 +113,7 @@ function getMessage($user)
 
 
 
-            echo '<div id ="message-' . $id . '" class="message  ' . $alignment . ' ' . $class . ' ">
+            echo '<div id ="message-' . $id . '" class="message  ' . $alignment . ' ' . $class . ' " data-seen="' . $isSeen . '">
                    ' . $avatar . '
                     <div class="message-inner">
                         <div class="message-body"> 
